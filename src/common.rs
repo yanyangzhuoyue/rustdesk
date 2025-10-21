@@ -27,6 +27,7 @@ use hbb_common::{
     socket_client,
     sodiumoxide::crypto::{box_, secretbox, sign},
     timeout,
+    tls::{get_cached_tls_type, upsert_tls_type, TlsType},
     tokio::{
         self,
         net::UdpSocket,
@@ -36,7 +37,7 @@ use hbb_common::{
 };
 
 use crate::{
-    hbbs_http::create_http_client_async,
+    hbbs_http::{create_http_client_async, get_url_for_tls},
     ui_interface::{get_option, set_option},
 };
 
@@ -912,11 +913,29 @@ pub fn check_software_update() {
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
     let (request, url) =
         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
-    let latest_release_response = create_http_client_async()
-        .post(url)
-        .json(&request)
-        .send()
-        .await?;
+    let proxy_conf = Config::get_socks();
+    let tls_url = get_url_for_tls(&url, &proxy_conf);
+    let tls_type = get_cached_tls_type(tls_url);
+    let is_tls_not_cached = tls_type.is_none();
+    let tls_type = tls_type.unwrap_or(TlsType::NativeTls);
+    let client = create_http_client_async(tls_type);
+    let latest_release_response = match client.post(&url).json(&request).send().await {
+        Ok(resp) => {
+            upsert_tls_type(tls_url, tls_type);
+            resp
+        }
+        Err(err) => {
+            if is_tls_not_cached && err.is_request() {
+                let tls_type = TlsType::Rustls;
+                let client = create_http_client_async(tls_type);
+                let resp = client.post(&url).json(&request).send().await?;
+                upsert_tls_type(tls_url, TlsType::Rustls);
+                resp
+            } else {
+                return Err(err.into());
+            }
+        }
+    };
     let bytes = latest_release_response.bytes().await?;
     let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
     let response_url = resp.url;
@@ -1067,7 +1086,34 @@ pub fn get_audit_server(api: String, custom: String, typ: String) -> String {
 }
 
 pub async fn post_request(url: String, body: String, header: &str) -> ResultType<String> {
-    let mut req = create_http_client_async().post(url);
+    let proxy_conf = Config::get_socks();
+    let tls_url = get_url_for_tls(&url, &proxy_conf);
+    let tls_type = get_cached_tls_type(tls_url);
+    let response = if tls_type.is_some() {
+        // This branch is used when tls_type is cached (regardless of its value),
+        // which avoids cloning the body parameter.
+        post_request_inner(&url, tls_url, body, header, tls_type)
+            .await?
+            .ok_or_else(|| anyhow!("HTTP request failed!"))?
+    } else {
+        match post_request_inner(&url, tls_url, body.clone(), header, tls_type).await? {
+            Some(resp) => resp,
+            None => post_request_inner(&url, tls_url, body, header, Some(TlsType::Rustls))
+                .await?
+                .ok_or_else(|| anyhow!("HTTP request failed!"))?,
+        }
+    };
+    Ok(response.text().await?)
+}
+
+async fn post_request_inner(
+    url: &str,
+    tls_url: &str,
+    body: String,
+    header: &str,
+    tls_type: Option<TlsType>,
+) -> ResultType<Option<reqwest::Response>> {
+    let mut req = create_http_client_async(tls_type.unwrap_or(TlsType::NativeTls)).post(url);
     if !header.is_empty() {
         let tmp: Vec<&str> = header.split(": ").collect();
         if tmp.len() == 2 {
@@ -1076,7 +1122,21 @@ pub async fn post_request(url: String, body: String, header: &str) -> ResultType
     }
     req = req.header("Content-Type", "application/json");
     let to = std::time::Duration::from_secs(12);
-    Ok(req.body(body).timeout(to).send().await?.text().await?)
+    match req.body(body).timeout(to).send().await {
+        Ok(resp) => {
+            upsert_tls_type(tls_url, tls_type.unwrap_or(TlsType::NativeTls));
+            Ok(Some(resp))
+        }
+        Err(e) => {
+            if tls_type.is_none() && e.is_request() {
+                log::warn!("HTTP request failed: {:?}, try again with rustls", e);
+                Ok(None)
+            } else {
+                log::error!("HTTP request failed: {:?}", e);
+                Err(anyhow!("HTTP request failed: {}", e))
+            }
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -1084,22 +1144,23 @@ pub async fn post_request_sync(url: String, body: String, header: &str) -> Resul
     post_request(url, body, header).await
 }
 
-#[tokio::main(flavor = "current_thread")]
-pub async fn http_request_sync(
-    url: String,
-    method: String,
+async fn get_http_response_async(
+    url: &str,
+    tls_url: &str,
+    method: &str,
     body: Option<String>,
-    header: String,
-) -> ResultType<String> {
-    let http_client = create_http_client_async();
-    let mut http_client = match method.as_str() {
+    header: &str,
+    tls_type: Option<TlsType>,
+) -> ResultType<Option<reqwest::Response>> {
+    let http_client = create_http_client_async(tls_type.unwrap_or(TlsType::NativeTls));
+    let mut http_client = match method {
         "get" => http_client.get(url),
         "post" => http_client.post(url),
         "put" => http_client.put(url),
         "delete" => http_client.delete(url),
         _ => return Err(anyhow!("The HTTP request method is not supported!")),
     };
-    let v = serde_json::from_str(header.as_str())?;
+    let v = serde_json::from_str(header)?;
 
     if let Value::Object(obj) = v {
         for (key, value) in obj.iter() {
@@ -1113,11 +1174,59 @@ pub async fn http_request_sync(
         http_client = http_client.body(b);
     }
 
-    let response = http_client
+    match http_client
         .timeout(std::time::Duration::from_secs(12))
         .send()
-        .await?;
+        .await
+    {
+        Ok(resp) => {
+            upsert_tls_type(tls_url, tls_type.unwrap_or(TlsType::NativeTls));
+            Ok(Some(resp))
+        }
+        Err(e) => {
+            if tls_type.is_none() && e.is_request() {
+                log::warn!("HTTP request failed: {:?}, try again with rustls", e);
+                Ok(None)
+            } else {
+                log::error!("HTTP request failed: {:?}", e);
+                Err(anyhow!("HTTP request failed: {}", e))
+            }
+        }
+    }
+}
 
+#[tokio::main(flavor = "current_thread")]
+pub async fn http_request_sync(
+    url: String,
+    method: String,
+    body: Option<String>,
+    header: String,
+) -> ResultType<String> {
+    let proxy_conf = Config::get_socks();
+    let tls_url = get_url_for_tls(&url, &proxy_conf);
+    let tls_type = get_cached_tls_type(tls_url);
+    let response = if tls_type.is_some() {
+        // This branch is used to reduce a `clone()` when `tls_type` is `TlsType::Rustls`.
+        get_http_response_async(&url, tls_url, &method, body, &header, tls_type)
+            .await?
+            .ok_or_else(|| anyhow!("HTTP request failed!"))?
+    } else {
+        match get_http_response_async(&url, tls_url, &method, body.clone(), &header, tls_type)
+            .await?
+        {
+            Some(resp) => resp,
+            None => get_http_response_async(
+                &url,
+                tls_url,
+                &method,
+                body,
+                &header,
+                Some(TlsType::Rustls),
+            )
+            .await?
+            .ok_or_else(|| anyhow!("HTTP request failed!"))?,
+        }
+    };
     // Serialize response headers
     let mut response_headers = serde_json::map::Map::new();
     for (key, value) in response.headers() {
