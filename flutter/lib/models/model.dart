@@ -33,6 +33,7 @@ import 'package:tuple/tuple.dart';
 import 'package:image/image.dart' as img2;
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
+import 'package:get/get_rx/src/rx_workers/utils/debouncer.dart';
 import 'package:uuid/uuid.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:file_picker/file_picker.dart';
@@ -1713,8 +1714,49 @@ class ImageModel with ChangeNotifier {
 }
 
 enum ScrollStyle {
-  scrollbar,
-  scrollauto,
+  scrollbar(kRemoteScrollStyleBar),
+  scrollauto(kRemoteScrollStyleAuto),
+  scrolledge(kRemoteScrollStyleEdge);
+
+  const ScrollStyle(this.stringValue);
+
+  final String stringValue;
+
+  String toJson() {
+    return name;
+  }
+
+  static ScrollStyle fromJson(String json, [ScrollStyle? fallbackValue]) {
+    switch (json) {
+      case 'scrollbar': return scrollbar;
+      case 'scrollauto': return scrollauto;
+      case 'scrolledge': return scrolledge;
+    }
+
+    if (fallbackValue != null) {
+      return fallbackValue;
+    }
+
+    throw ArgumentError("Unknown ScrollStyle JSON value: '$json'");
+  }
+
+  @override String toString() {
+    return stringValue;
+  }
+
+  static ScrollStyle fromString(String string, [ScrollStyle? fallbackValue]) {
+    switch (string) {
+      case kRemoteScrollStyleBar: return scrollbar;
+      case kRemoteScrollStyleAuto: return scrollauto;
+      case kRemoteScrollStyleEdge: return scrolledge;
+    }
+
+    if (fallbackValue != null) {
+      return fallbackValue;
+    }
+
+    throw ArgumentError("Unknown ScrollStyle string value: '$string'");
+  }
 }
 
 class ViewStyle {
@@ -1810,6 +1852,9 @@ class CanvasModel with ChangeNotifier {
   // scroll offset y percent
   double _scrollY = 0.0;
   ScrollStyle _scrollStyle = ScrollStyle.scrollauto;
+  // briefly set to true when the canvas detects a resize
+  bool _suppressEdgeScroll = false;
+  final Debouncer _suppressEdgeScrollDebounce = Debouncer(delay: Duration(milliseconds: 200));
   ViewStyle _lastViewStyle = ViewStyle.defaultViewStyle();
 
   Timer? _timerMobileFocusCanvasCursor;
@@ -1835,14 +1880,35 @@ class CanvasModel with ChangeNotifier {
   double get devicePixelRatio => _devicePixelRatio;
   Size get size => _size;
   ScrollStyle get scrollStyle => _scrollStyle;
+  bool get suppressEdgeScroll => _suppressEdgeScroll;
   ViewStyle get viewStyle => _lastViewStyle;
   RxBool get imageOverflow => _imageOverflow;
+
+  void notifyResize()
+  {
+    _suppressEdgeScrollDebounce.cancel();
+    _suppressEdgeScroll = true;
+    _suppressEdgeScrollDebounce.call(
+      ()
+      {
+        _suppressEdgeScroll = false;
+      });
+  }
 
   _resetScroll() => setScrollPercent(0.0, 0.0);
 
   setScrollPercent(double x, double y) {
     _scrollX = x;
     _scrollY = y;
+  }
+
+  pushScrollPositionToUI(double scrollPixelX, double scrollPixelY) {
+    if (_horizontal.hasClients) {
+      _horizontal.jumpTo(scrollPixelX);
+    }
+    if (_vertical.hasClients) {
+      _vertical.jumpTo(scrollPixelY);
+    }
   }
 
   ScrollController get scrollHorizontal => _horizontal;
@@ -1957,13 +2023,14 @@ class CanvasModel with ChangeNotifier {
   }
 
   tryUpdateScrollStyle(Duration duration, String? style) async {
-    if (_scrollStyle != ScrollStyle.scrollbar) return;
+    if (_scrollStyle == ScrollStyle.scrollauto) return;
     style ??= await bind.sessionGetViewStyle(sessionId: sessionId);
     if (style != kRemoteViewStyleOriginal && style != kRemoteViewStyleCustom) {
       return;
     }
 
     _resetScroll();
+
     Future.delayed(duration, () async {
       updateScrollPercent();
     });
@@ -1971,12 +2038,13 @@ class CanvasModel with ChangeNotifier {
 
   updateScrollStyle() async {
     final style = await bind.sessionGetScrollStyle(sessionId: sessionId);
-    if (style == kRemoteScrollStyleBar) {
-      _scrollStyle = ScrollStyle.scrollbar;
+
+    _scrollStyle = ScrollStyle.fromString(style!);
+
+    if (_scrollStyle != ScrollStyle.scrollauto) {
       _resetScroll();
-    } else {
-      _scrollStyle = ScrollStyle.scrollauto;
     }
+
     notifyListeners();
   }
 
@@ -2049,6 +2117,74 @@ class CanvasModel with ChangeNotifier {
           //
         }
       }
+    }
+  }
+
+  edgeScrollMouse(double x, double y) {
+    if (size.width == 0 || size.height == 0) {
+      return;
+    }
+
+    if (!_horizontal.hasClients || !_vertical.hasClients) {
+      return;
+    }
+
+    if (_suppressEdgeScroll) {
+      return;
+    }
+
+    // Trigger scrolling when the cursor is close to an edge
+    const double edgeThickness = 120;
+
+    // But not right at the very edge, otherwise it could trigger by accident when
+    // hovering around the window border.
+    const double safeZoneThickness = 20;
+
+    var dxOffset = 0.0;
+    var dyOffset = 0.0;
+
+    double scrollPixelX = _horizontal.position.pixels;
+    double scrollPixelY = _vertical.position.pixels;
+
+    final maxX = _horizontal.position.maxScrollExtent;
+    final maxY = _vertical.position.maxScrollExtent;
+
+    Rect activeZone = Rect.fromLTWH(0, 0, size.width, size.height)
+      .deflate(safeZoneThickness);
+
+    if (activeZone.contains(Offset(x, y))) {
+      if (x < edgeThickness) {
+        dxOffset = x - edgeThickness;
+      } else if ((x >= size.width - edgeThickness)) {
+        dxOffset = x - (size.width - edgeThickness);
+      }
+
+      if (y < edgeThickness) {
+        dyOffset = y - edgeThickness;
+      } else if ((y >= size.height - edgeThickness)) {
+        dyOffset = y - (size.height - edgeThickness);
+      }
+    }
+
+    dxOffset = dxOffset.clamp(-scrollPixelX, maxX - scrollPixelX);
+    dyOffset = dyOffset.clamp(-scrollPixelY, maxY - scrollPixelY);
+
+    if (dxOffset != 0 || dyOffset != 0) {
+      scrollPixelX += dxOffset;
+      scrollPixelY += dyOffset;
+
+      setScrollPercent(scrollPixelX / maxX, scrollPixelY / maxY);
+      pushScrollPositionToUI(scrollPixelX, scrollPixelY);
+
+      notifyListeners();
+
+      dxOffset += dxOffset.sign * 0.5;
+      dyOffset += dyOffset.sign * 0.5;
+
+      rustDeskWinManager.call(
+        WindowType.Main,
+        kWindowBumpMouse,
+        {"dx": -dxOffset.round(), "dy": -dyOffset.round()});
     }
   }
 
