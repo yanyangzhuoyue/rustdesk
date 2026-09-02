@@ -15,6 +15,8 @@ mod ipc_drm;
 #[cfg(all(target_os = "linux", feature = "drm"))]
 pub use ipc_drm::{start_drm, DmabufDesc, DrmDisplayInfo};
 #[cfg(all(target_os = "linux", feature = "drm"))]
+pub(crate) use ipc_drm::drm_capture_active;
+#[cfg(all(target_os = "linux", feature = "drm"))]
 pub(crate) use ipc_drm::DrmConn;
 #[cfg(all(target_os = "linux", feature = "drm"))]
 pub(crate) use ipc_drm::connect_drm;
@@ -1876,6 +1878,26 @@ pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
         c.next_timeout(1000).await.ok();
     }
     Config::set_options(value);
+    Ok(())
+}
+
+/// Push this process's config into the running root service.
+///
+/// `set_options` reaches the user `--server`, which then syncs to root on its own. That leaves out
+/// the case where there is no `--server` at all: the root service keeps its config in memory from
+/// startup, so a change made by a root CLI would sit in the config file unread until a restart.
+/// `SyncConfig` is the only message the protected `_service` channel accepts, and root is an allowed
+/// peer on it, so this is the same operation the user server performs, from the other side.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn sync_config_to_service() -> ResultType<()> {
+    let mut c = connect_service(1000).await?;
+    let cfg = (Config::get(), Config2::get());
+    c.send(&Data::SyncConfig(Some(cfg.into()))).await?;
+    // The service acks a pushed config with SyncConfig(None); anything else did not apply it.
+    if !matches!(c.next_timeout(1000).await?, Some(Data::SyncConfig(None))) {
+        bail!("unexpected reply from the service");
+    }
     Ok(())
 }
 
