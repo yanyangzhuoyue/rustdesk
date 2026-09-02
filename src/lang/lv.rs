@@ -763,5 +763,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "Bloķēt audeklu"),
         ("Sync clipboard between sessions", "Sinhronizēt starpliktuvi starp sesijām"),
         ("sync-clipboard-between-sessions-tip", "Vienā attālajā sesijā nokopētais teksts vai attēli tiek nosūtīti arī uz pārējo pievienoto sesiju starpliktuvi."),
+        ("Enable WebRTC P2P connection", "Iespējot WebRTC P2P savienojumu"),
+        ("Enable TCP hole punching", "Iespējot TCP caurumu veidošanu"),
     ].iter().cloned().collect();
 }

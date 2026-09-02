@@ -763,5 +763,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "Tuvali kilitle"),
         ("Sync clipboard between sessions", "Oturumlar arasında panoyu senkronize et"),
         ("sync-clipboard-between-sessions-tip", "Bir uzak oturumda kopyalanan metin veya görseller, bağlı diğer oturumlarınızın panosuna da gönderilir."),
+        ("Enable WebRTC P2P connection", "WebRTC P2P bağlantısını etkinleştir"),
+        ("Enable TCP hole punching", "TCP delik açmayı etkinleştir"),
     ].iter().cloned().collect();
 }

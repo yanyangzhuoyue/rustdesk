@@ -185,6 +185,14 @@ impl<T: InvokeUiSession> Remote<T> {
                     .unwrap()
                     .set_connected();
                 let is_secured = peer.is_secured();
+                // Only WebRTC needs refining: its label names the transport that won the race,
+                // not the family ICE ended up nominating, and it is the one path where the two
+                // can disagree with the address the rendezvous observed.
+                let stream_type = if peer.webrtc_remote_ipv6().await.unwrap_or(false) {
+                    "WebRTC/IPv6"
+                } else {
+                    stream_type
+                };
                 self.handler
                     .set_connection_type(is_secured, direct, stream_type); // flutter -> connection_ready
                 if !is_secured
@@ -196,6 +204,11 @@ impl<T: InvokeUiSession> Remote<T> {
                         tokio::time::sleep(KCP_CLOSE_REASON_FLUSH_DELAY).await;
                     }
                     self.handle_disconnected(round);
+                    // Close the WebRTC pc on this decline path too (no-op for TCP/WS); otherwise its
+                    // pc lingers in the global session cache until ICE decays on its own. The pc
+                    // and its teardown live on hbb_common's WebRTC I/O runtime, so this session
+                    // runtime's death on return affects neither.
+                    peer.close_webrtc();
                     return;
                 }
                 self.handler.update_direct(Some(direct));
@@ -342,6 +355,14 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
                 log::debug!("Exit io_loop of id={}", self.handler.get_id());
+                // Close the WebRTC peer connection (if this session used it) so its pc is not left
+                // lingering in the global session cache after the session ends; dropping `peer`
+                // alone does not release it. No-op for TCP/WebSocket transports. The pc, its
+                // sockets and pump tasks, and this close all live on hbb_common's WebRTC I/O
+                // runtime — nothing may run them on this session runtime, which is dropped the
+                // moment io_loop returns and would kill the teardown (or, if awaited under a
+                // timeout, cancel it after `close()` latches `is_closed`, stranding the pc).
+                peer.close_webrtc();
                 // Stop client audio server.
                 if let Some(s) = self.stop_voice_call_sender.take() {
                     s.send(()).ok();

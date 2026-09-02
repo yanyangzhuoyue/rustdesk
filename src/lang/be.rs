@@ -763,5 +763,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Lock canvas", "Заблакіраваць палатно"),
         ("Sync clipboard between sessions", "Сінхранізаваць буфер абмену паміж сеансамі"),
         ("sync-clipboard-between-sessions-tip", "Тэкст або відарысы, скапіяваныя ў адным аддаленым сеансе, таксама адпраўляюцца ў буфер абмену іншых вашых падключаных сеансаў."),
+        ("Enable WebRTC P2P connection", "Выкарыстоўваць падключэнне WebRTC P2P"),
+        ("Enable TCP hole punching", "Выкарыстоўваць TCP hole punching"),
     ].iter().cloned().collect();
 }
