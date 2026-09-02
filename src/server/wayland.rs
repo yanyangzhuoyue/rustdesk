@@ -33,12 +33,38 @@ pub(super) fn increment_active_display_count() -> usize {
     *count
 }
 
-pub(super) fn decrement_active_display_count() -> usize {
+/// Decrement and, when this was the last service, tear the shared state down UNDER THE SAME count
+/// guard. A separate decrement-then-clear leaves a window where a newly admitted service grabs the
+/// old capturer pointer and clear() then frees it out from under `c.frame()`; holding the guard
+/// makes admission (which increments under the same lock) wait until the teardown is done.
+/// run() calls ensure_inited BEFORE it increments, so the two locks are never held together: the
+/// map guard is released inside ensure_inited, and the capturer pointer is only read after the
+/// count has been taken.
+pub(super) fn decrement_active_display_count_and_clear_if_last() {
     let mut count = ACTIVE_DISPLAY_COUNT.write().unwrap();
     if *count > 0 {
         *count -= 1;
     }
-    *count
+    if *count == 0 {
+        clear();
+    }
+}
+
+/// A geometry bail must rebuild the SHARED capture state, but `clear()` only runs when the last
+/// service exits - with another monitor or camera stream active the count never reaches zero and
+/// every retry reuses the same cached capturer and rectangle. The flag asks EVERY wayland service
+/// to exit its loop so the count drains, the last one clears, and the next entries rebuild fresh.
+static RESTART_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn request_restart() {
+    if is_x11() {
+        return;
+    }
+    RESTART_PENDING.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(super) fn restart_pending() -> bool {
+    !is_x11() && RESTART_PENDING.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 fn map_err_scrap(err: String) -> io::Error {
@@ -426,6 +452,8 @@ pub fn clear() {
 
     // Reset PipeWire initialization flag to allow recreation on next init
     *PIPEWIRE_INITIALIZED.write().unwrap() = false;
+    // The teardown this flag asked for has happened; later services start clean.
+    RESTART_PENDING.store(false, std::sync::atomic::Ordering::SeqCst);
 }
 
 /// Initialize the PipeWire/portal capture path from the plain (sync) video thread, so a DRM display

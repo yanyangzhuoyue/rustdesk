@@ -550,11 +550,10 @@ fn run(vs: VideoService) -> ResultType<()> {
         SimpleCallOnReturn {
             b: true,
             f: Box::new(|| {
-                // Decrement active display count and only clear if this was the last display
-                let remaining_count = super::wayland::decrement_active_display_count();
-                if remaining_count == 0 {
-                    super::wayland::clear();
-                }
+                // Decrement and clear under ONE count guard: a separate decrement-then-clear lets
+                // a newly admitted service grab the old capturer pointer right before clear()
+                // frees it.
+                super::wayland::decrement_active_display_count_and_clear_if_last();
             }),
         }
     };
@@ -675,6 +674,11 @@ fn run(vs: VideoService) -> ResultType<()> {
             log::info!("switch to refresh");
             bail!("SWITCH");
         }
+        #[cfg(target_os = "linux")]
+        if super::wayland::restart_pending() {
+            log::info!("switch so the shared wayland capture state can rebuild");
+            bail!("SWITCH");
+        }
         if codec_format != Encoder::negotiated_codec() {
             log::info!(
                 "switch due to codec changed, {:?} -> {:?}",
@@ -724,6 +728,30 @@ fn run(vs: VideoService) -> ResultType<()> {
         let res = match c.frame(spf) {
             Ok(frame) => {
                 repeat_encode_counter = 0;
+                // Rebuild when a mode change hands back a frame that no longer matches the size
+                // this capturer/encoder pair was built with: convert_to_yuv only refuses LARGER
+                // sources, and a smaller one lands in the old canvas leaving stale edges.
+                // Monitors only. A camera's size comes from the cache `Cameras::all_info()` filled
+                // before the stream was open, and nothing refreshes it on a retry, so bailing here
+                // would rebuild with the same size that just failed and bail again forever.
+                if vs.source.is_monitor() {
+                    if let scrap::Frame::PixelBuffer(f) = &frame {
+                        if f.width() != capture_width || f.height() != capture_height {
+                            // With another wayland stream active, exiting alone rebuilds NOTHING:
+                            // the shared state survives and the retry reuses the same stale
+                            // rectangle. Ask every wayland service to drain so the last one clears.
+                            #[cfg(target_os = "linux")]
+                            super::wayland::request_restart();
+                            bail!(
+                                "frame {}x{} is not the {}x{} this capturer was built with; rebuilding",
+                                f.width(),
+                                f.height(),
+                                capture_width,
+                                capture_height
+                            );
+                        }
+                    }
+                }
                 if frame.valid() {
                     let screenshot_key = (vs.source, display_idx);
                     let screenshot = SCREENSHOTS.lock().unwrap().remove(&screenshot_key);
