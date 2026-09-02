@@ -435,10 +435,55 @@ class InputModel {
   int _trackpadSpeed = kDefaultTrackpadSpeed;
   double _trackpadSpeedInner = kDefaultTrackpadSpeed / 100.0;
   var _trackpadScrollUnsent = Offset.zero;
+  // Whether a pan was actually opened on an Android peer for the current
+  // gesture (deferred until the first scroll update that gets sent), and the
+  // canvas position that pan started at.
+  bool _trackpadPanOpen = false;
+  Offset _trackpadPanStartPos = Offset.zero;
+
+  /// The last pan_start payload after full mapping (peer-screen units),
+  /// stashed by handlePointerEvent, and the cumulative whole-pixel deltas
+  /// queued as pan_updates for the current gesture. Together they replay the
+  /// receiver's stored mouseX/mouseY arithmetic (see
+  /// [_queuePanEndUnconditionally]).
+  Point? _trackpadPanStartMapped;
+  Offset _trackpadPanSentDelta = Offset.zero;
+
+  /// Serializes touch pan event sends (pan_start → pan_update(s) → pan_end)
+  /// from every sender (synthetic trackpad path and native pan-zoom path).
+  /// sessionSendPointer is an frb Normal task dispatched to a multi-worker
+  /// thread pool on the Rust side, so back-to-back submissions can execute
+  /// out of order — and the Android peer's startGesture/continueGesture/
+  /// endGesture sequence is order-dependent. Chaining each send onto the
+  /// previous one's Future preserves submission order.
+  Future<void> _panEventChain = Future.value();
 
   // Mobile relative mouse delta accumulators (for slow/fine movements).
   double _mobileDeltaRemainderX = 0.0;
   double _mobileDeltaRemainderY = 0.0;
+
+  // [FIX #15630] Android trackpad 1-finger vs 2-finger routing.
+  //
+  // The Xiaomi (and similar) trackpad reports:
+  //   • 1-finger glide  -> a pure hover stream (kind=touch, buttons=0)
+  //   • 2-finger gesture-> a synthesized LEFT-BUTTON DRAG: PointerDown/Move/Up
+  //                        with kind=touch + left button. There is NO ACTION_SCROLL
+  //                        / PointerPanZoom signal, so Flutter's usual trackpad
+  //                        scroll path never fires.
+  //   • 1-finger tap    -> kind=mouse (TOOL_TYPE_MOUSE), handled as a normal click.
+  //
+  // Hover events only ever originate from the trackpad (a finger on the touchscreen
+  // physically cannot hover), so we learn the trackpad's pointer [device] id from a
+  // hover event and use it to tell a trackpad 2-finger drag apart from a real
+  // touchscreen drag — which must keep flowing through touch mode.
+  int? _trackpadHoverDeviceId;
+  bool _trackpadTwoFinger = false;
+
+  /// The trackpad's pointer [device] id, exposed only on mobile (the Android
+  /// trackpad routing is mobile-only) so the touch gesture recognizer can
+  /// ignore the device's synthesized 2-finger drag. Returns null on desktop,
+  /// where no such routing exists.
+  int? get trackpadHoverDeviceId => isDesktop ? null : _trackpadHoverDeviceId;
 
   var _lastScale = 1.0;
 
@@ -1201,6 +1246,94 @@ class InputModel {
         })));
   }
 
+  /// [FIX #15630] Start a trackpad 2-finger gesture: latch scroll mode, reset
+  /// the fractional-scroll accumulator, and record the (canvas) position the
+  /// gesture started at. Shared by the Down path (onPointDownImage) and the
+  /// defensive relatch in onPointMoveImage. Idempotent: a repeat call for an
+  /// already-latched gesture must not reset the accumulator or reopen a pan.
+  ///
+  /// The Android peer pan is NOT opened here — a Down/Up with no movement (or
+  /// one whose scaled accumulator never reaches a whole pixel) must not send a
+  /// bare pan_start/pan_end pair, which the peer would replay as a tap or
+  /// long-press. The pan is opened lazily by _sendTrackpadTwoFingerScroll on
+  /// the first update that actually gets sent.
+  void _beginTrackpadTwoFinger(Offset position) {
+    if (_trackpadTwoFinger) return;
+    _trackpadTwoFinger = true;
+    _trackpadScrollUnsent = Offset.zero;
+    _trackpadPanOpen = false;
+    _trackpadPanSentDelta = Offset.zero;
+    _trackpadPanStartPos = position;
+  }
+
+  /// [FIX #15630] Send a smooth scroll for an Android trackpad 2-finger gesture.
+  ///
+  /// The device reports 2-finger as a pressed touch-drag (there is no native
+  /// ACTION_SCROLL / pan-zoom signal), so we translate the per-frame delta into the
+  /// same `trackpad` message the desktop 2-finger path emits, consumed server-side
+  /// as smooth scrolling. Scaled by the user-tunable trackpad speed.
+  void _sendTrackpadTwoFingerScroll(double dx, double dy) {
+    if (isViewOnly || isViewCamera) return;
+    var delta = Offset(dx, dy) * _trackpadSpeedInner;
+    delta = _filterTrackpadDeltaAxis(delta);
+    // Keep the gesture alive even for sub-pixel movement, and accumulate the
+    // fractional remainder (reset on gesture start) so a slow scroll does not
+    // stall on deltas that truncate to zero.
+    if (peerPlatform == kPeerPlatformLinux) {
+      delta *= _trackpadAdjustPeerLinux;
+    }
+    _trackpadScrollUnsent += delta;
+    final x = _trackpadScrollUnsent.dx.truncate();
+    final y = _trackpadScrollUnsent.dy.truncate();
+    _trackpadScrollUnsent -= Offset(x.toDouble(), y.toDouble());
+    if (x == 0 && y == 0) return;
+    // For an Android-controlled peer, the established trackpad-pan route sends
+    // touch pan events (onPointerPanZoomUpdate does the same) — an Android peer
+    // does not consume the `trackpad` mouse message. Mirror that branch so
+    // Xiaomi-style synthetic input scrolls an Android peer like a native trackpad.
+    if (peerPlatform == kPeerPlatformAndroid) {
+      // Open the pan on the first update that is actually sent (never on the
+      // Down alone), so a gesture that produces no scroll never becomes a
+      // stationary tap/long-press on the peer.
+      if (!_trackpadPanOpen) {
+        // handlePointerEvent can silently drop the start (peer control
+        // protected, or no remote rect yet). Leave the pan closed and skip the
+        // update in that case, so the next deliverable move retries the start
+        // instead of emitting an update the peer has no gesture for.
+        if (!handlePointerEvent(
+            'touch', kMouseEventTypePanStart, _trackpadPanStartPos)) {
+          // The whole-pixel part was already taken out of the accumulator:
+          // put it back so it is retried with the next deliverable move
+          // instead of being dropped — a fast flick during the blocked
+          // window would otherwise lose every frame's pixels.
+          _trackpadScrollUnsent += Offset(x.toDouble(), y.toDouble());
+          return;
+        }
+        _trackpadPanOpen = true;
+      }
+      final delta = Offset(x.toDouble(), y.toDouble());
+      // Track exactly what was queued — an update rejected by peer-control
+      // protection must not count, or the terminal reconstruction
+      // (_queuePanEndUnconditionally) would drift from the receiver's
+      // stored-position arithmetic by the unapplied delta sum. Give rejected
+      // pixels back to the accumulator for the same reason the start path
+      // does: they are scroll the user performed, not scroll to discard.
+      if (handlePointerEvent('touch', kMouseEventTypePanUpdate, delta)) {
+        _trackpadPanSentDelta += delta;
+      } else {
+        _trackpadScrollUnsent += delta;
+      }
+      return;
+    }
+    bind.sessionSendMouse(
+        sessionId: sessionId,
+        msg: json.encode(modify({
+          'type': 'trackpad',
+          'x': '$x',
+          'y': '$y',
+        })));
+  }
+
   /// Update the pointer lock center position based on current window frame.
   Future<void> updatePointerLockCenter({Offset? localCenter}) {
     return _relativeMouse.updatePointerLockCenter(localCenter: localCenter);
@@ -1286,6 +1419,45 @@ class InputModel {
   void onPointHoverImage(PointerHoverEvent e) {
     _stopFling = true;
     if (isViewOnly && !showMyCursor) return;
+    // [FIX #15630] Android trackpad. Xiaomi (and some Samsung) trackpads report
+    // SOURCE_MOUSE + TOOL_TYPE_FINGER, which Flutter maps to PointerDeviceKind.touch
+    // and delivers here as a hover. A finger touching the screen never produces a
+    // hover (only ACTION_DOWN/MOVE), so a touch-kind hover is uniquely the trackpad
+    // — record its device id (used to identify 2-finger drags in onPointDownImage)
+    // and route its per-frame delta to a relative cursor move.
+    // Android-only and touch-kind only. iPadOS also reports Magic Trackpad
+    // pointers as kind=trackpad, and a kind=trackpad device on Android would
+    // break the same way: learning its id makes every wrapped recognizer drop
+    // its downs (IgnoreDeviceGestureRecognizerMixin) while the down/move/up
+    // routing below only matches kind=touch, so its taps and 2-finger scroll
+    // would go dead. Don't learn trackpad-kind pointers — without a learned id
+    // the mixin is inert and their taps still fire through the recognizers.
+    if (isAndroid && e.kind == ui.PointerDeviceKind.touch) {
+      // During a 2-finger scroll gesture the device also emits hover frames;
+      // skip them so the cursor does not drift while scrolling, and learn the
+      // device id only while idle — learning mid-gesture would let a
+      // concurrent pointer source (e.g. a second trackpad) overwrite it and
+      // strand the latch. The latch is cleared only by the gesture's terminal
+      // event — the Up (onPointUpImage) or a cancel (onPointCancelImage),
+      // both of which run regardless of view mode; if a platform ever loses
+      // both, only a full 2-finger Down→Up cycle clears it again.
+      if (_trackpadTwoFinger) {
+        return;
+      }
+      _trackpadHoverDeviceId = e.device;
+      // Absolute positioning: map the (Android-driven) cursor position to remote
+      // canvas coords, exactly like a real mouse hover. Unlike a relative
+      // move_relative, this keeps the remote cursor visible, reaches the full
+      // screen, and does not drift — matching the behaviour the device's
+      // synthesized 2-finger drag used to produce via handleMouse.
+      final canvasPosition = _pointerPositionForRemoteCanvas(e);
+      // A touch-kind hover is a pure move with no buttons; use the stateless
+      // move event so it cannot synthesize a release for another device's held
+      // button via _getMouseEvent's shared _lastButtons comparison.
+      handleMouse(getMouseEventMove(), canvasPosition,
+          edgeScroll: useEdgeScroll);
+      return;
+    }
     if (e.kind != ui.PointerDeviceKind.mouse) return;
 
     // May fix https://github.com/rustdesk/rustdesk/issues/13009
@@ -1519,6 +1691,33 @@ class InputModel {
     if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
 
+    // [FIX #15630] Android trackpad 2-finger start. The device synthesizes a
+    // 2-finger gesture as a left-button drag with kind=touch (a real 1-finger
+    // tap-to-click is kind=mouse). Restrict to the trackpad device (learned from
+    // hover) so an actual touchscreen drag still flows through touch mode. Latch
+    // scroll mode and swallow the Down so it does not become a spurious click.
+    if (!isDesktop &&
+        e.kind == ui.PointerDeviceKind.touch &&
+        (e.buttons & 0x1) != 0 &&
+        _trackpadHoverDeviceId != null &&
+        e.device == _trackpadHoverDeviceId) {
+      // The synthetic 2-finger Down is touch-kind input, not mouse: clear
+      // the physical-mouse flag exactly like the generic touch branch below
+      // would, so remote_page remounts the touch gesture region. Without
+      // this, tap-to-click (kind=mouse, flag -> true, region unmounted)
+      // followed by a 2-finger scroll (this early return, flag stays true)
+      // swallows the first real touchscreen tap: its Down is spent flipping
+      // the flag while the region is still unmounted, and its Up returns at
+      // the kind != mouse guard. The wrapped recognizers ignore the trackpad
+      // device (IgnoreDeviceGestureRecognizerMixin), so mounting the region
+      // here cannot fire stray gestures off the scroll itself.
+      if (isPhysicalMouse.value) {
+        isPhysicalMouse.value = false;
+      }
+      _beginTrackpadTwoFinger(_pointerPositionForRemoteCanvas(e));
+      return;
+    }
+
     // Track mouse down events for duplicate detection on iOS.
     final nowMs = DateTime.now().millisecondsSinceEpoch;
     if (e.kind == ui.PointerDeviceKind.mouse) {
@@ -1557,6 +1756,35 @@ class InputModel {
 
   void onPointUpImage(PointerUpEvent e) {
     if (isDesktop) _queryOtherWindowCoords = false;
+
+    // [FIX #15630] End of an Android trackpad 2-finger gesture. Clear the
+    // latch before the view-mode guards below: if the session turned view-only
+    // (or camera view) mid-gesture, those guards would swallow this Up and
+    // strand the latch, freezing 1-finger cursor moves (onPointHoverImage)
+    // once the session is interactive again. Require the learned trackpad
+    // device so an unrelated touchscreen up cannot terminate the gesture.
+    if (!isDesktop &&
+        e.kind == ui.PointerDeviceKind.touch &&
+        _trackpadHoverDeviceId != null &&
+        e.device == _trackpadHoverDeviceId &&
+        _trackpadTwoFinger) {
+      _trackpadTwoFinger = false;
+      // Close the peer pan only if one was actually opened (i.e. a scroll
+      // update was queued); a bare Down/Up must not emit a stationary stroke.
+      // The terminal event is queued unconditionally: every queued pan_update
+      // dispatched willContinue=true on the peer, and only pan_end dispatches
+      // the willContinue=false release — letting the eligibility checks reject
+      // it (peer-control protection, no remote rect, camera mode) would leave
+      // the remote app with a held touch / unintended long-press. Its payload
+      // reconstructs the receiver's stored position (see the helper), so the
+      // release cannot relocate the remote pointer.
+      if (peerPlatform == kPeerPlatformAndroid && _trackpadPanOpen) {
+        _queuePanEndUnconditionally();
+        _trackpadPanOpen = false;
+      }
+      return;
+    }
+
     if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
 
@@ -1578,9 +1806,52 @@ class InputModel {
     }
   }
 
+  // [FIX #15630] A system gesture (e.g. an Android edge swipe) can steal the
+  // 2-finger stream mid-scroll; the platform then delivers a cancel instead of
+  // an up. Clear the latch here like onPointUpImage does, otherwise 1-finger
+  // cursor moves (onPointHoverImage) stay frozen until the next clean 2-finger
+  // cycle. No view-mode guard on purpose: cancelling is pure state cleanup.
+  void onPointCancelImage(PointerCancelEvent e) {
+    if (!isDesktop &&
+        e.kind == ui.PointerDeviceKind.touch &&
+        _trackpadHoverDeviceId != null &&
+        e.device == _trackpadHoverDeviceId &&
+        _trackpadTwoFinger) {
+      _trackpadTwoFinger = false;
+      // Mirror onPointUpImage: queue the terminal pan_end unconditionally —
+      // only if a pan was actually opened (a scroll update was queued); its
+      // payload reconstructs the receiver's stored position (see the helper).
+      if (peerPlatform == kPeerPlatformAndroid && _trackpadPanOpen) {
+        _queuePanEndUnconditionally();
+        _trackpadPanOpen = false;
+      }
+    }
+  }
+
   void onPointMoveImage(PointerMoveEvent e) {
     if (isViewOnly && !showMyCursor) return;
     if (isViewCamera) return;
+
+    // [FIX #15630] Android trackpad 2-finger motion: the device reports it as a
+    // pressed touch-drag (kind=touch + left button) on the trackpad device. Convert
+    // the per-frame delta into a smooth scroll. Other touch moves (e.g. a real
+    // touchscreen drag) are dropped here as before.
+    if (!isDesktop && e.kind == ui.PointerDeviceKind.touch) {
+      // Only the learned trackpad device drives the 2-finger scroll, so a
+      // concurrent real touchscreen drag is not mistaken for scrolling.
+      if (_trackpadHoverDeviceId != null &&
+          e.device == _trackpadHoverDeviceId &&
+          (e.buttons & 0x1) != 0) {
+        // The Down (onPointDownImage) normally starts the gesture already;
+        // starting it here too covers a missed Down (the helper is
+        // idempotent), so interleaved hover frames stay suppressed
+        // (onPointHoverImage) and the peer sees a proper pan_start before
+        // the first pan_update.
+        _beginTrackpadTwoFinger(_pointerPositionForRemoteCanvas(e));
+        _sendTrackpadTwoFingerScroll(e.delta.dx, e.delta.dy);
+      }
+      return;
+    }
     if (e.kind != ui.PointerDeviceKind.mouse) return;
 
     if (_relativeMouse.enabled.value) {
@@ -1747,11 +2018,32 @@ class InputModel {
     return Offset(x, y);
   }
 
-  void handlePointerEvent(String kind, String type, Offset offset) {
+  /// Send a touch pointer event to the peer. Returns whether the event was
+  /// accepted and queued — callers that open a stateful gesture (pan_start)
+  /// must check this, because the event is dropped when peer control is
+  /// protected, the remote rect is not ready, or the view is in camera mode.
+  /// The actual send is chained onto [_panEventChain] so pan_start /
+  /// pan_update / pan_end reach the peer in submission order.
+  bool handlePointerEvent(String kind, String type, Offset offset) {
+    // Camera mode is a pure no-op: return before any position mapping or
+    // peer-control check, both of which mutate local cursor/canvas state
+    // (handlePointerDevicePos, _checkPeerControlProtected) without sending.
+    if (isViewCamera) return false;
     double x = offset.dx;
     double y = offset.dy;
-    if (_checkPeerControlProtected(x, y)) {
-      return;
+    if (type == kMouseEventTypePanUpdate) {
+      // A pan_update payload is a scroll delta, not a canvas position:
+      // _checkPeerControlProtected unconditionally writes its arguments into
+      // the shared lastMousePos (even when the check passes), which would
+      // pollute the mouse path's coordinate state and make the
+      // distance-based control arbitration always pass for deltas. Honor
+      // only the hard protection flag here — the pan_start already ran the
+      // full check with a real position.
+      if (parent.target!.cursorModel.isPeerControlProtected) {
+        return false;
+      }
+    } else if (_checkPeerControlProtected(x, y)) {
+      return false;
     }
     // Only touch events are handled for now. So we can just ignore buttons.
     // to-do: handle mouse events
@@ -1772,7 +2064,13 @@ class InputModel {
         type,
       );
       if (pos == null) {
-        return;
+        return false;
+      }
+      if (type == kMouseEventTypePanStart) {
+        // The unconditional terminal path (_queuePanEndUnconditionally)
+        // reuses the mapped start to reconstruct the receiver's stored
+        // pointer position.
+        _trackpadPanStartMapped = pos;
       }
       evtValue = {
         'x': pos.x.toInt(),
@@ -1780,10 +2078,64 @@ class InputModel {
       };
     }
 
-    final evt = PointerEventToRust(kind, type, evtValue).toJson();
-    if (isViewCamera) return;
-    bind.sessionSendPointer(
-        sessionId: sessionId, msg: json.encode(modify(evt)));
+    final msg =
+        json.encode(modify(PointerEventToRust(kind, type, evtValue).toJson()));
+    // Serialize with any pan event already in flight (see [_panEventChain]).
+    // Each link swallows its own error so one failed send cannot break the
+    // chain and strand later pan events.
+    _panEventChain = _panEventChain.then((_) async {
+      try {
+        await bind.sessionSendPointer(sessionId: sessionId, msg: msg);
+      } catch (e) {
+        debugPrint('[InputModel] failed to send pan event $type: $e');
+      }
+    });
+    return true;
+  }
+
+  /// [FIX #15630] Queue a pan_end with no eligibility checks (peer-control
+  /// protection, remote-rect availability, camera mode) and no position
+  /// mapping: once a pan was opened, the peer's injected touch must be
+  /// released — every pan_update dispatched willContinue=true, and only this
+  /// terminal event dispatches the willContinue=false continuation. The
+  /// eligibility checks should suppress new input, not the release of input
+  /// this client already pressed; a rejected terminal event leaves the remote
+  /// app with a held touch / unintended long-press.
+  ///
+  /// The payload position is NOT ignored by the receiver: TOUCH_PAN_END
+  /// overwrites the shared mouseX/mouseY with it, and subsequent
+  /// positionless events (button down/up are encoded with x=0,y=0; Android
+  /// only updates the position on a move) act at that stored position — so
+  /// an unmapped controller-canvas coordinate would relocate the remote
+  /// pointer. Reconstruct the receiver's stored position instead: pan_start
+  /// set it from the mapped start payload, and every queued pan_update
+  /// subtracted its delta — replay that arithmetic ([_trackpadPanStartMapped]
+  /// minus [_trackpadPanSentDelta]). A single final clamp mirrors the
+  /// receiver's per-update clamping except when a gesture pins the top/left
+  /// edge and reverses; that divergence is bounded by the clamped-away
+  /// distance and the payload stays a valid non-negative coordinate.
+  void _queuePanEndUnconditionally() {
+    // Null is unreachable while _trackpadPanOpen is true: opening requires a
+    // queued pan_start, which stashed the mapped payload.
+    final start = _trackpadPanStartMapped;
+    final end = start == null
+        ? Offset.zero
+        : Offset(
+            (start.x - _trackpadPanSentDelta.dx).clamp(0, double.infinity),
+            (start.y - _trackpadPanSentDelta.dy).clamp(0, double.infinity),
+          );
+    final msg = json.encode(modify(PointerEventToRust('touch',
+            kMouseEventTypePanEnd, {
+          'x': end.dx.toInt(),
+          'y': end.dy.toInt(),
+        }).toJson()));
+    _panEventChain = _panEventChain.then((_) async {
+      try {
+        await bind.sessionSendPointer(sessionId: sessionId, msg: msg);
+      } catch (e) {
+        debugPrint('[InputModel] failed to send pan event PanEnd: $e');
+      }
+    });
   }
 
   bool _checkPeerControlProtected(double x, double y) {
